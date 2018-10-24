@@ -1,0 +1,28 @@
+Vagrant.configure(2) do |config|
+  config.vm.box = "ubuntu/bionic64"
+  config.vm.provider :virtualbox do |vb|
+    vb.customize ["modifyvm", :id, "--memory", 2048]
+    vb.customize ["modifyvm", :id, "--cpus", 1]
+  end
+  config.vm.define "master" do |master|
+    master.vm.hostname = "master"
+    master.vm.network "public_network", bridge: "HostInterfaceNetworking-Intel(R) Dual Band Wireless-AC 8265", ip: "192.168.0.110"
+    master.vm.network "forwarded_port", host: 6443, guest: 6443
+	for i in 2379..2380
+		config.vm.network :forwarded_port, guest: i, host: i
+	end
+	for i in 10250..10252
+		config.vm.network :forwarded_port, guest: i, host: i
+	end
+
+  end
+  config.vm.define "node1" do |node1|
+    node1.vm.hostname = "node1"
+    node1.vm.network "public_network", bridge: "HostInterfaceNetworking-Intel(R) Dual Band Wireless-AC 8265", ip: "192.168.0.120"
+    node1.vm.network "forwarded_port", host: 10250, guest: 10250
+	for i in 30000..32767
+		config.vm.network :forwarded_port, guest: i, host: i
+	end
+  end
+  
+end
