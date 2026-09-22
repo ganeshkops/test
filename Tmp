@@ -1,0 +1,609 @@
+import boto3
+import json
+import os
+from pathlib import PurePosixPath
+
+
+# ============================================================
+# AWS CLIENTS
+# ============================================================
+
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+transfer = boto3.client("transfer")
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Maximum allowed file size: 15 MiB
+MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
+
+# SNS topic used for validation failure notifications.
+# Configure this as a Lambda environment variable.
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+
+# Destination bucket
+DESTINATION_BUCKET = "samsung-s3-viaero-dbr-delta"
+
+
+# ============================================================
+# DIRECTORY / FILE NAME / DESTINATION MAPPING
+# ============================================================
+#
+# directory:
+#   filename_pattern -> text that MUST exist in filename
+#   prefix           -> final S3 destination prefix
+#
+# Example:
+#
+# Upload:
+#   SAM_NR_CELL/test_nr_cell_20260914.csv
+#
+# Destination:
+#   s3://samsung-s3-viaero-dbr-delta/
+#   __unitystorage/.../44d038.../
+#   test_nr_cell_20260914.csv
+#
+# ============================================================
+
+DIRECTORY_CONFIG = {
+
+    "HUA_LTE": {
+        "filename_pattern": "hua_lte",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "9500bc7c-a5d1-4fd7-ac53-c239f21a8693/"
+        )
+    },
+
+    "SAM_LTE_CELL": {
+        "filename_pattern": "lte_cell",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "2d84812e-f0e6-43c5-9132-7ef64c70239/"
+        )
+    },
+
+    "SAM_LTE_SITE": {
+        "filename_pattern": "lte_site",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "f159a85f-806a-4734-bdf2-d78198c0f24a/"
+        )
+    },
+
+    "SAM_NR_CELL": {
+        "filename_pattern": "nr_cell",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "44d038f3-e5ac-4c73-97f4-e293123df77a/"
+        )
+    },
+
+    "SAM_NR_SITE": {
+        "filename_pattern": "nr_site",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "cbe95427-e8d4-4c74-922a-e9bfb1f1dc35/"
+        )
+    },
+
+    "ERI_LTE": {
+        "filename_pattern": "eri_lte",
+        "prefix": (
+            "__unitystorage/catalogs/"
+            "a0e5e112-c600-4ac6-9398-acc1a78a4f88/"
+            "volumes/"
+            "b99f9504-a184-4d44-b8a2-2dba5c2312a4/"
+        )
+    }
+}
+
+
+# ============================================================
+# FIND SFTP DIRECTORY
+# ============================================================
+
+def get_source_directory(source_key):
+    """
+    Determine which configured SFTP directory contains the file.
+
+    Examples:
+
+        HUA_LTE/file.csv
+        incoming/HUA_LTE/file.csv
+        users/vendor1/HUA_LTE/file.csv
+
+    All of the above return:
+
+        HUA_LTE
+    """
+
+    path_parts = PurePosixPath(source_key).parts
+
+    # Exclude filename itself
+    directory_parts = path_parts[:-1]
+
+    for part in directory_parts:
+
+        part_upper = part.upper()
+
+        if part_upper in DIRECTORY_CONFIG:
+            return part_upper
+
+    return None
+
+
+# ============================================================
+# TRANSFER FAMILY WORKFLOW CALLBACK
+# ============================================================
+
+def send_workflow_status(event, status):
+    """
+    Tell AWS Transfer Family whether the custom workflow
+    step succeeded or failed.
+    """
+
+    execution_details = (
+        event["serviceMetadata"]["executionDetails"]
+    )
+
+    response = transfer.send_workflow_step_state(
+        WorkflowId=execution_details["workflowId"],
+        ExecutionId=execution_details["executionId"],
+        Token=event["token"],
+        Status=status
+    )
+
+    print(
+        f"Transfer Family workflow status sent: {status}"
+    )
+
+    return response
+
+
+# ============================================================
+# SNS NOTIFICATION
+# ============================================================
+
+def send_failure_notification(
+    username,
+    source_directory,
+    filename,
+    file_size,
+    errors
+):
+    """
+    Send validation failure information to SNS.
+    """
+
+    if not SNS_TOPIC_ARN:
+        print(
+            "SNS_TOPIC_ARN is not configured. "
+            "Skipping SNS notification."
+        )
+        return
+
+    size_mb = file_size / (1024 * 1024)
+
+    error_text = "\n".join(
+        f"- {error}" for error in errors
+    )
+
+    message = f"""
+AWS Transfer Family File Validation Failed
+
+User:
+{username}
+
+Upload Directory:
+{source_directory or "UNKNOWN"}
+
+File:
+{filename}
+
+File Size:
+{size_mb:.2f} MB
+
+Validation Errors:
+{error_text}
+
+File Requirements:
+1. File must be uploaded to a valid directory.
+2. Filename must contain the expected pattern for that directory.
+3. File extension must be .csv.
+4. File size must not exceed 15 MB.
+
+Allowed Directories:
+- HUA_LTE
+- ERI_LTE
+- SAM_LTE_CELL
+- SAM_LTE_SITE
+- SAM_NR_CELL
+- SAM_NR_SITE
+
+Please correct the file and upload it again.
+"""
+
+    try:
+
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="SFTP File Validation Failed",
+            Message=message
+        )
+
+        print("SNS validation failure notification sent.")
+
+    except Exception as e:
+
+        # SNS failure should not prevent the workflow from
+        # returning FAILURE.
+        print(
+            f"WARNING: Failed to publish SNS notification: {e}"
+        )
+
+
+# ============================================================
+# GENERAL ERROR NOTIFICATION
+# ============================================================
+
+def send_processing_error_notification(
+    username,
+    filename,
+    error_message
+):
+
+    if not SNS_TOPIC_ARN:
+        return
+
+    message = f"""
+AWS Transfer Family File Processing Error
+
+User:
+{username}
+
+File:
+{filename}
+
+Error:
+{error_message}
+"""
+
+    try:
+
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="SFTP File Processing Error",
+            Message=message
+        )
+
+    except Exception as e:
+
+        print(
+            f"WARNING: Failed to send processing "
+            f"error notification: {e}"
+        )
+
+
+# ============================================================
+# MAIN LAMBDA FUNCTION
+# ============================================================
+
+def lambda_handler(event, context):
+
+    print("=" * 70)
+    print("AWS Transfer Family workflow event received")
+    print(json.dumps(event, indent=2))
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # GET SOURCE FILE INFORMATION FROM TRANSFER FAMILY EVENT
+    # --------------------------------------------------------
+
+    source_bucket = event["fileLocation"]["bucket"]
+    source_key = event["fileLocation"]["key"]
+
+    # VersionId can exist when S3 versioning is enabled
+    source_version_id = (
+        event["fileLocation"].get("versionId")
+    )
+
+    transfer_details = (
+        event["serviceMetadata"]
+        .get("transferDetails", {})
+    )
+
+    username = transfer_details.get(
+        "userName",
+        "UNKNOWN"
+    )
+
+    filename = PurePosixPath(source_key).name
+    filename_lower = filename.lower()
+
+    print(f"User          : {username}")
+    print(f"Source Bucket : {source_bucket}")
+    print(f"Source Key    : {source_key}")
+    print(f"Filename      : {filename}")
+
+    validation_errors = []
+
+    # Default in case HeadObject fails
+    file_size = 0
+
+    try:
+
+        # ====================================================
+        # 1. DETERMINE SOURCE DIRECTORY
+        # ====================================================
+
+        source_directory = get_source_directory(
+            source_key
+        )
+
+        print(
+            f"Detected Directory: {source_directory}"
+        )
+
+        if not source_directory:
+
+            validation_errors.append(
+                "File was not uploaded into one of the "
+                "allowed SFTP directories."
+            )
+
+        # ====================================================
+        # 2. GET FILE SIZE
+        # ====================================================
+
+        head_arguments = {
+            "Bucket": source_bucket,
+            "Key": source_key
+        }
+
+        if source_version_id:
+
+            head_arguments["VersionId"] = (
+                source_version_id
+            )
+
+        head_response = s3.head_object(
+            **head_arguments
+        )
+
+        file_size = head_response["ContentLength"]
+
+        file_size_mb = (
+            file_size / (1024 * 1024)
+        )
+
+        print(
+            f"File Size     : "
+            f"{file_size} bytes "
+            f"({file_size_mb:.2f} MB)"
+        )
+
+        # ====================================================
+        # 3. VALIDATE FILE EXTENSION
+        # ====================================================
+
+        if not filename_lower.endswith(".csv"):
+
+            validation_errors.append(
+                "Invalid file extension. "
+                "Only .csv files are allowed."
+            )
+
+        # ====================================================
+        # 4. VALIDATE FILE SIZE
+        # ====================================================
+
+        if file_size > MAX_FILE_SIZE_BYTES:
+
+            validation_errors.append(
+                f"File size is {file_size_mb:.2f} MB. "
+                "Maximum allowed size is 15 MB."
+            )
+
+        # ====================================================
+        # 5. VALIDATE FILE NAME
+        # ====================================================
+
+        if source_directory:
+
+            directory_config = (
+                DIRECTORY_CONFIG[source_directory]
+            )
+
+            required_pattern = (
+                directory_config[
+                    "filename_pattern"
+                ].lower()
+            )
+
+            print(
+                f"Required filename pattern: "
+                f"{required_pattern}"
+            )
+
+            if required_pattern not in filename_lower:
+
+                validation_errors.append(
+                    f"Invalid filename for directory "
+                    f"'{source_directory}'. "
+                    f"Filename must contain "
+                    f"'{required_pattern}'."
+                )
+
+        # ====================================================
+        # 6. HANDLE VALIDATION FAILURE
+        # ====================================================
+
+        if validation_errors:
+
+            print("=" * 70)
+            print("FILE VALIDATION FAILED")
+
+            for error in validation_errors:
+                print(f"- {error}")
+
+            print("=" * 70)
+
+            send_failure_notification(
+                username=username,
+                source_directory=source_directory,
+                filename=filename,
+                file_size=file_size,
+                errors=validation_errors
+            )
+
+            send_workflow_status(
+                event,
+                "FAILURE"
+            )
+
+            return {
+                "statusCode": 200,
+                "status": "FAILED",
+                "username": username,
+                "file": filename,
+                "source_directory": (
+                    source_directory
+                ),
+                "errors": validation_errors
+            }
+
+        # ====================================================
+        # 7. GET DESTINATION CONFIGURATION
+        # ====================================================
+
+        directory_config = (
+            DIRECTORY_CONFIG[source_directory]
+        )
+
+        destination_prefix = (
+            directory_config["prefix"]
+        )
+
+        destination_key = (
+            f"{destination_prefix}{filename}"
+        )
+
+        print("=" * 70)
+        print("VALIDATION SUCCESSFUL")
+        print(
+            f"Source:"
+            f" s3://{source_bucket}/{source_key}"
+        )
+        print(
+            f"Destination:"
+            f" s3://{DESTINATION_BUCKET}/"
+            f"{destination_key}"
+        )
+        print("=" * 70)
+
+        # ====================================================
+        # 8. BUILD COPY SOURCE
+        # ====================================================
+
+        copy_source = {
+            "Bucket": source_bucket,
+            "Key": source_key
+        }
+
+        if source_version_id:
+
+            copy_source["VersionId"] = (
+                source_version_id
+            )
+
+        # ====================================================
+        # 9. COPY FILE TO CORRECT DESTINATION
+        # ====================================================
+
+        s3.copy_object(
+            CopySource=copy_source,
+            Bucket=DESTINATION_BUCKET,
+            Key=destination_key
+        )
+
+        print(
+            "File copied successfully."
+        )
+
+        print(
+            f"Final destination: "
+            f"s3://{DESTINATION_BUCKET}/"
+            f"{destination_key}"
+        )
+
+        # ====================================================
+        # 10. SEND SUCCESS TO TRANSFER FAMILY
+        # ====================================================
+
+        send_workflow_status(
+            event,
+            "SUCCESS"
+        )
+
+        return {
+            "statusCode": 200,
+            "status": "SUCCESS",
+            "username": username,
+            "file": filename,
+            "source_directory": source_directory,
+            "source": (
+                f"s3://{source_bucket}/"
+                f"{source_key}"
+            ),
+            "destination": (
+                f"s3://{DESTINATION_BUCKET}/"
+                f"{destination_key}"
+            )
+        }
+
+    except Exception as e:
+
+        print("=" * 70)
+        print("UNEXPECTED FILE PROCESSING ERROR")
+        print(str(e))
+        print("=" * 70)
+
+        # Send operational error notification
+        send_processing_error_notification(
+            username=username,
+            filename=filename,
+            error_message=str(e)
+        )
+
+        # Tell Transfer Family that processing failed
+        try:
+
+            send_workflow_status(
+                event,
+                "FAILURE"
+            )
+
+        except Exception as workflow_error:
+
+            print(
+                "ERROR: Could not send FAILURE "
+                "status to Transfer Family:"
+            )
+
+            print(str(workflow_error))
+
+        raise
