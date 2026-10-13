@@ -1,0 +1,789 @@
+import boto3
+import json
+import os
+import urllib.parse
+
+from pathlib import PurePosixPath
+from botocore.exceptions import ClientError
+
+
+# ============================================================
+# AWS CLIENTS
+# ============================================================
+
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Source SFTP S3 bucket
+EXPECTED_SOURCE_BUCKET = (
+    "s3-sftp-home-225897220833-us-east-1-an"
+)
+
+# Files must be uploaded underneath this path
+SOURCE_BASE_PREFIX = "shared-space"
+
+# Destination bucket
+DESTINATION_BUCKET = (
+    "samsung-s3-viaero-dbr-delta"
+)
+
+# Maximum allowed file size
+MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
+
+# Optional SNS topic
+SNS_TOPIC_ARN = os.environ.get(
+    "SNS_TOPIC_ARN",
+    ""
+)
+
+
+# ============================================================
+# DIRECTORY CONFIGURATION
+# ============================================================
+#
+# For each SFTP directory:
+#
+# filename_pattern:
+#     Required text in filename
+#
+# prefix:
+#     Destination S3 path
+#
+# ============================================================
+
+DIRECTORY_CONFIG = {
+
+    "HUA_LTE": {
+        "filename_pattern": "hua_lte",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/9500bc7c-a5d1-4fd7-ac53-c239f21a8693/"
+    },
+
+    "SAM_LTE_CELL": {
+        "filename_pattern": "lte_cell",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/2d84812e-f0e6-43c5-9132-7ef64c70239/"
+    },
+
+    "SAM_LTE_SITE": {
+        "filename_pattern": "lte_site",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/f159a85f-806a-4734-bdf2-d78198c0f24a/"
+    },
+
+    "SAM_NR_CELL": {
+        "filename_pattern": "nr_cell",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/44d038f3-e5ac-4c73-97f4-e293123df77a/"
+    },
+
+    "SAM_NR_SITE": {
+        "filename_pattern": "nr_site",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/cbe95427-e8d4-4c74-922a-e9bfb1f1dc35/"
+    },
+
+    "ERI_LTE": {
+        "filename_pattern": "eri_lte",
+        "prefix": "__unitystorage/catalogs/a0e5e112-c600-4ac6-9398-acc1a78a4f88/volumes/b99f9504-a184-4d44-b8a2-2dba5c2312a4/"
+    }
+}
+
+
+# ============================================================
+# GET UPLOAD DIRECTORY
+# ============================================================
+
+def get_source_directory(source_key):
+    """
+    Expected examples:
+
+    shared-space/HUA_LTE/test_hua_lte.csv
+    shared-space/ERI_LTE/test_eri_lte.csv
+    shared-space/SAM_LTE_CELL/test_lte_cell.csv
+    shared-space/SAM_LTE_SITE/test_lte_site.csv
+    shared-space/SAM_NR_CELL/test_nr_cell.csv
+    shared-space/SAM_NR_SITE/test_nr_site.csv
+    """
+
+    path_parts = PurePosixPath(source_key).parts
+
+    # Minimum:
+    #
+    # shared-space / SAM_NR_CELL / file.csv
+    #
+    if len(path_parts) < 3:
+        return None
+
+    # Verify source base path
+    if path_parts[0] != SOURCE_BASE_PREFIX:
+        return None
+
+    source_directory = path_parts[1].upper()
+
+    if source_directory not in DIRECTORY_CONFIG:
+        return None
+
+    return source_directory
+
+
+# ============================================================
+# SNS VALIDATION FAILURE NOTIFICATION
+# ============================================================
+
+def send_validation_failure_notification(
+    source_bucket,
+    source_key,
+    source_directory,
+    filename,
+    file_size,
+    errors
+):
+    """
+    Send SNS notification when file validation fails.
+    """
+
+    if not SNS_TOPIC_ARN:
+        print(
+            "SNS_TOPIC_ARN is not configured. "
+            "Skipping notification."
+        )
+        return
+
+    size_mb = file_size / (1024 * 1024)
+
+    error_text = "\n".join(
+        f"- {error}" for error in errors
+    )
+
+    message = f"""
+AWS SFTP File Validation Failed
+
+Source Bucket:
+{source_bucket}
+
+Source Key:
+{source_key}
+
+Upload Directory:
+{source_directory or "UNKNOWN"}
+
+File:
+{filename}
+
+File Size:
+{size_mb:.2f} MB
+
+Validation Errors:
+{error_text}
+
+Required Conditions:
+- File must be uploaded to a valid SFTP directory.
+- Filename must contain the expected pattern.
+- File extension must be .csv.
+- File size must not exceed 15 MB.
+
+The invalid file has been removed from the SFTP source location.
+"""
+
+    try:
+
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="SFTP File Validation Failed",
+            Message=message
+        )
+
+        print(
+            "Validation failure SNS notification sent."
+        )
+
+    except Exception as e:
+
+        # Do not stop cleanup just because SNS failed
+        print(
+            f"WARNING: SNS notification failed: {e}"
+        )
+
+
+# ============================================================
+# PROCESSING ERROR NOTIFICATION
+# ============================================================
+
+def send_processing_error_notification(
+    source_bucket,
+    source_key,
+    error_message
+):
+
+    if not SNS_TOPIC_ARN:
+        return
+
+    message = f"""
+AWS SFTP File Processing Error
+
+Source:
+s3://{source_bucket}/{source_key}
+
+Error:
+{error_message}
+
+The source file has NOT intentionally been deleted because
+processing did not complete successfully.
+"""
+
+    try:
+
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="SFTP File Processing Error",
+            Message=message
+        )
+
+    except Exception as e:
+
+        print(
+            f"WARNING: Could not send processing "
+            f"error notification: {e}"
+        )
+
+
+# ============================================================
+# DELETE SOURCE OBJECT
+# ============================================================
+
+def delete_source_object(
+    bucket,
+    key,
+    version_id=None
+):
+    """
+    Delete the uploaded source file.
+
+    If S3 versioning is enabled and the event contains
+    a VersionId, delete that exact version.
+    """
+
+    delete_args = {
+        "Bucket": bucket,
+        "Key": key
+    }
+
+    if version_id:
+        delete_args["VersionId"] = version_id
+
+    s3.delete_object(
+        **delete_args
+    )
+
+    print(
+        f"Source file deleted: "
+        f"s3://{bucket}/{key}"
+    )
+
+
+# ============================================================
+# PROCESS ONE S3 OBJECT
+# ============================================================
+
+def process_record(record):
+
+    # --------------------------------------------------------
+    # READ S3 EVENT
+    # --------------------------------------------------------
+
+    source_bucket = (
+        record["s3"]["bucket"]["name"]
+    )
+
+    encoded_key = (
+        record["s3"]["object"]["key"]
+    )
+
+    # S3 event keys are URL encoded
+    source_key = urllib.parse.unquote_plus(
+        encoded_key,
+        encoding="utf-8"
+    )
+
+    source_version_id = (
+        record["s3"]["object"].get(
+            "versionId"
+        )
+    )
+
+    event_name = record.get(
+        "eventName",
+        "UNKNOWN"
+    )
+
+    print("=" * 70)
+    print("PROCESSING S3 EVENT")
+    print(f"Event Name    : {event_name}")
+    print(f"Source Bucket : {source_bucket}")
+    print(f"Source Key    : {source_key}")
+    print(f"Version ID    : {source_version_id}")
+    print("=" * 70)
+
+
+    # --------------------------------------------------------
+    # VERIFY SOURCE BUCKET
+    # --------------------------------------------------------
+
+    if source_bucket != EXPECTED_SOURCE_BUCKET:
+
+        print(
+            f"Ignoring event from unexpected bucket: "
+            f"{source_bucket}"
+        )
+
+        return {
+            "status": "IGNORED",
+            "reason": "Unexpected source bucket",
+            "bucket": source_bucket,
+            "key": source_key
+        }
+
+
+    # --------------------------------------------------------
+    # IGNORE FOLDER PLACEHOLDERS
+    # --------------------------------------------------------
+
+    if source_key.endswith("/"):
+
+        print(
+            f"Ignoring folder marker: {source_key}"
+        )
+
+        return {
+            "status": "IGNORED",
+            "reason": "Folder marker",
+            "key": source_key
+        }
+
+
+    filename = PurePosixPath(
+        source_key
+    ).name
+
+    filename_lower = filename.lower()
+
+    source_directory = get_source_directory(
+        source_key
+    )
+
+    validation_errors = []
+
+    file_size = 0
+
+
+    try:
+
+        # ====================================================
+        # GET OBJECT INFORMATION
+        # ====================================================
+
+        head_args = {
+            "Bucket": source_bucket,
+            "Key": source_key
+        }
+
+        if source_version_id:
+
+            head_args["VersionId"] = (
+                source_version_id
+            )
+
+        try:
+
+            head_response = s3.head_object(
+                **head_args
+            )
+
+        except ClientError as e:
+
+            error_code = (
+                e.response
+                .get("Error", {})
+                .get("Code")
+            )
+
+            # S3 notifications are delivered at least once.
+            # A duplicate event may arrive after the first
+            # execution already deleted the source object.
+            if error_code in (
+                "404",
+                "NoSuchKey",
+                "NoSuchVersion"
+            ):
+
+                print(
+                    "Source object no longer exists. "
+                    "This may be a duplicate S3 event."
+                )
+
+                return {
+                    "status": "IGNORED",
+                    "reason": (
+                        "Object already processed "
+                        "or no longer exists"
+                    ),
+                    "key": source_key
+                }
+
+            raise
+
+
+        file_size = (
+            head_response["ContentLength"]
+        )
+
+        file_size_mb = (
+            file_size / (1024 * 1024)
+        )
+
+        print(
+            f"Filename       : {filename}"
+        )
+
+        print(
+            f"Directory      : {source_directory}"
+        )
+
+        print(
+            f"File size      : "
+            f"{file_size_mb:.2f} MB"
+        )
+
+
+        # ====================================================
+        # VALIDATION 1:
+        # VALID SOURCE DIRECTORY
+        # ====================================================
+
+        if not source_directory:
+
+            validation_errors.append(
+                "File was not uploaded into one of "
+                "the allowed SFTP directories."
+            )
+
+
+        # ====================================================
+        # VALIDATION 2:
+        # FILE EXTENSION
+        # ====================================================
+
+        if not filename_lower.endswith(".csv"):
+
+            validation_errors.append(
+                "Invalid file extension. "
+                "Only .csv files are allowed."
+            )
+
+
+        # ====================================================
+        # VALIDATION 3:
+        # FILE SIZE
+        # ====================================================
+
+        if file_size > MAX_FILE_SIZE_BYTES:
+
+            validation_errors.append(
+                f"File size is {file_size_mb:.2f} MB. "
+                "Maximum allowed size is 15 MB."
+            )
+
+
+        # ====================================================
+        # VALIDATION 4:
+        # FILE NAME MUST MATCH DIRECTORY
+        # ====================================================
+
+        if source_directory:
+
+            config = (
+                DIRECTORY_CONFIG[
+                    source_directory
+                ]
+            )
+
+            required_pattern = (
+                config[
+                    "filename_pattern"
+                ].lower()
+            )
+
+            print(
+                f"Required pattern: "
+                f"{required_pattern}"
+            )
+
+            if required_pattern not in filename_lower:
+
+                validation_errors.append(
+                    f"Invalid filename for "
+                    f"'{source_directory}'. "
+                    f"Filename must contain "
+                    f"'{required_pattern}'."
+                )
+
+
+        # ====================================================
+        # VALIDATION FAILURE
+        # ====================================================
+
+        if validation_errors:
+
+            print("=" * 70)
+            print("VALIDATION FAILED")
+
+            for error in validation_errors:
+                print(f"- {error}")
+
+            print("=" * 70)
+
+
+            # Send failure email/SNS first
+            send_validation_failure_notification(
+                source_bucket=source_bucket,
+                source_key=source_key,
+                source_directory=source_directory,
+                filename=filename,
+                file_size=file_size,
+                errors=validation_errors
+            )
+
+
+            # Delete invalid source file
+            delete_source_object(
+                bucket=source_bucket,
+                key=source_key,
+                version_id=source_version_id
+            )
+
+
+            return {
+                "status": "VALIDATION_FAILED",
+                "file": filename,
+                "source_directory": (
+                    source_directory
+                ),
+                "source_deleted": True,
+                "errors": validation_errors
+            }
+
+
+        # ====================================================
+        # VALIDATION SUCCESS
+        # ====================================================
+
+        print(
+            "All validation checks passed."
+        )
+
+
+        # ====================================================
+        # BUILD DESTINATION
+        # ====================================================
+
+        directory_config = (
+            DIRECTORY_CONFIG[
+                source_directory
+            ]
+        )
+
+        destination_prefix = (
+            directory_config["prefix"]
+        )
+
+        destination_key = (
+            destination_prefix + filename
+        )
+
+
+        print(
+            f"Source      : "
+            f"s3://{source_bucket}/{source_key}"
+        )
+
+        print(
+            f"Destination : "
+            f"s3://{DESTINATION_BUCKET}/"
+            f"{destination_key}"
+        )
+
+
+        # ====================================================
+        # BUILD COPY SOURCE
+        # ====================================================
+
+        copy_source = {
+            "Bucket": source_bucket,
+            "Key": source_key
+        }
+
+        if source_version_id:
+
+            copy_source["VersionId"] = (
+                source_version_id
+            )
+
+
+        # ====================================================
+        # COPY VALID FILE
+        # ====================================================
+
+        s3.copy_object(
+            CopySource=copy_source,
+            Bucket=DESTINATION_BUCKET,
+            Key=destination_key
+        )
+
+
+        print(
+            "File copied successfully."
+        )
+
+
+        # ====================================================
+        # DELETE SOURCE AFTER SUCCESSFUL COPY
+        # ====================================================
+
+        delete_source_object(
+            bucket=source_bucket,
+            key=source_key,
+            version_id=source_version_id
+        )
+
+
+        print("=" * 70)
+        print("FILE PROCESSING COMPLETED SUCCESSFULLY")
+        print("=" * 70)
+
+
+        return {
+            "status": "SUCCESS",
+            "file": filename,
+            "source_directory": (
+                source_directory
+            ),
+            "source": (
+                f"s3://{source_bucket}/"
+                f"{source_key}"
+            ),
+            "destination": (
+                f"s3://{DESTINATION_BUCKET}/"
+                f"{destination_key}"
+            ),
+            "source_deleted": True
+        }
+
+
+    except Exception as e:
+
+        print("=" * 70)
+        print("FILE PROCESSING ERROR")
+        print(f"Source: s3://{source_bucket}/{source_key}")
+        print(f"Error: {str(e)}")
+        print("=" * 70)
+
+
+        # Notify operational failure
+        send_processing_error_notification(
+            source_bucket=source_bucket,
+            source_key=source_key,
+            error_message=str(e)
+        )
+
+
+        # IMPORTANT:
+        #
+        # Do NOT delete the source file here.
+        #
+        # Copy/processing may have failed and keeping
+        # the source allows Lambda retry/troubleshooting.
+
+        raise
+
+
+# ============================================================
+# MAIN LAMBDA HANDLER
+# ============================================================
+
+def lambda_handler(event, context):
+
+    print(
+        "Received S3 event:"
+    )
+
+    print(
+        json.dumps(
+            event,
+            indent=2,
+            default=str
+        )
+    )
+
+
+    # Handle S3 test event
+    if event.get("Event") == "s3:TestEvent":
+
+        print(
+            "Received S3 TestEvent. "
+            "No file processing required."
+        )
+
+        return {
+            "status": "S3_TEST_EVENT"
+        }
+
+
+    records = event.get(
+        "Records",
+        []
+    )
+
+    if not records:
+
+        print(
+            "No S3 Records found in event."
+        )
+
+        return {
+            "status": "NO_RECORDS"
+        }
+
+
+    results = []
+
+
+    # S3 event can contain more than one record
+    for record in records:
+
+        # Only process S3 records
+        if record.get(
+            "eventSource"
+        ) != "aws:s3":
+
+            print(
+                "Ignoring non-S3 record."
+            )
+
+            continue
+
+
+        result = process_record(
+            record
+        )
+
+        results.append(
+            result
+        )
+
+
+    return {
+        "statusCode": 200,
+        "processedRecords": len(results),
+        "results": results
+    }
