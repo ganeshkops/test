@@ -1,0 +1,69 @@
+
+import boto3
+import json
+import os
+import time
+
+ecs = boto3.client("ecs")
+ec2 = boto3.client("ec2")
+
+CLUSTER = os.environ["ECS_CLUSTER"]
+TASK_DEF = os.environ["TASK_DEFINITION"]
+SUBNET = os.environ["SUBNET_ID"]
+SG = os.environ["SECURITY_GROUP_ID"]
+
+def lambda_handler(event, context):
+    response = ecs.run_task(
+        cluster=CLUSTER,
+        taskDefinition=TASK_DEF,
+        launchType="FARGATE",
+        count=1,
+        networkConfiguration={
+            "awsvpcConfiguration": {
+                "subnets": [SUBNET],
+                "securityGroups": [SG],
+                "assignPublicIp": "ENABLED"
+            }
+        }
+    )
+
+    if response.get("failures") or not response.get("tasks"):
+        return {
+            "statusCode": 500,
+            "body": json.dumps(response.get("failures", []))
+        }
+
+    task_arn = response["tasks"][0]["taskArn"]
+
+    # Wait for task to reach RUNNING
+    ecs.get_waiter("tasks_running").wait(
+        cluster=CLUSTER,
+        tasks=[task_arn],
+        WaiterConfig={"Delay": 6, "MaxAttempts": 20}
+    )
+
+    task = ecs.describe_tasks(
+        cluster=CLUSTER,
+        tasks=[task_arn]
+    )["tasks"][0]
+
+    eni_id = next(
+        detail["value"]
+        for attachment in task["attachments"]
+        for detail in attachment["details"]
+        if detail["name"] == "networkInterfaceId"
+    )
+
+    eni = ec2.describe_network_interfaces(
+        NetworkInterfaceIds=[eni_id]
+    )["NetworkInterfaces"][0]
+
+    public_ip = eni["Association"]["PublicIp"]
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "taskArn": task_arn,
+            "url": f"http://{public_ip}"
+        })
+    }
