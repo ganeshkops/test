@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Start, inspect, or stop your on-demand ECS Fargate task through API Gateway.
+# Requires Bash, curl, and jq. Works in Git Bash / WSL / Linux / macOS.
+set -euo pipefail
+
+API_BASE="${API_BASE:-https://m4jc8gp7s5.execute-api.us-east-1.amazonaws.com}"
+STATE_FILE="${STATE_FILE:-$HOME/.mcp-ecs-task-arn}"
+POLL_INTERVAL="${POLL_INTERVAL:-5}"
+MAX_POLLS="${MAX_POLLS:-36}"  # 36 * 5 seconds = 3 minutes
+
+if command -v curl.exe >/dev/null 2>&1; then
+  CURL="curl.exe"
+else
+  CURL="curl"
+fi
+
+for tool in "$CURL" jq; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Missing dependency: $tool" >&2
+    exit 1
+  fi
+done
+
+CURL_ARGS=(--silent --show-error --fail-with-body --connect-timeout 10 --max-time 30)
+# Helps with Windows corporate environments where certificate revocation servers
+# cannot be reached. Unlike --insecure, TLS certificate verification stays on.
+if [[ "$CURL" == "curl.exe" ]]; then
+  CURL_ARGS+=(--ssl-revoke-best-effort)
+fi
+
+request_status() {
+  "$CURL" "${CURL_ARGS[@]}" --get \
+    --data-urlencode "taskArn=$1" "$API_BASE/status"
+}
+
+status_field() {
+  jq -r --arg key "$2" '.[$key] // empty' <<< "$1"
+}
+
+assert_no_api_error() {
+  local error
+  error=$(status_field "$1" error)
+  if [[ -n "$error" ]]; then
+    echo "API error: $error" >&2
+    echo "$1" >&2
+    exit 1
+  fi
+}
+
+wait_for_running() {
+  local arn="$1" body state url private_ip public_ip
+  for ((attempt=1; attempt<=MAX_POLLS; attempt++)); do
+    body=$(request_status "$arn")
+    assert_no_api_error "$body"
+    state=$(status_field "$body" status)
+    echo "[$attempt/$MAX_POLLS] ECS task: ${state:-UNKNOWN}" >&2
+
+    case "$state" in
+      RUNNING)
+        url=$(status_field "$body" publicUrl)
+        private_ip=$(status_field "$body" privateIp)
+        public_ip=$(status_field "$body" publicIp)
+        if [[ -n "$private_ip" || -n "$public_ip" ]]; then
+          echo "Task ARN:   $arn"
+          echo "Private IP: ${private_ip:-not assigned}"
+          echo "Public IP:  ${public_ip:-not assigned}"
+          if [[ -n "$url" ]]; then
+            echo "URL:        $url"
+          elif [[ -n "$private_ip" ]]; then
+            echo "Private URL: http://$private_ip:80 (requires VPC connectivity)"
+          fi
+          echo "Note: RUNNING doesn't guarantee that Nginx is ready or that your network permits HTTP." >&2
+          return 0
+        fi
+        ;;
+      STOPPED)
+        echo "Task stopped before it became available: $(status_field "$body" reason)" >&2
+        rm -f "$STATE_FILE"
+        return 1
+        ;;
+    esac
+    sleep "$POLL_INTERVAL"
+  done
+  echo "Timed out waiting for a running task with an IP. Task ARN saved in $STATE_FILE" >&2
+  return 1
+}
+
+start_task() {
+  local response arn previous prev_body prev_state
+  if [[ -s "$STATE_FILE" ]]; then
+    previous=$(<"$STATE_FILE")
+    prev_body=$(request_status "$previous")
+    assert_no_api_error "$prev_body"
+    prev_state=$(status_field "$prev_body" status)
+    if [[ "$prev_state" != "STOPPED" && -n "$prev_state" ]]; then
+      echo "Reusing previously started task: $previous" >&2
+      wait_for_running "$previous"
+      return
+    fi
+  fi
+
+  response=$("$CURL" "${CURL_ARGS[@]}" --request POST "$API_BASE/start")
+  assert_no_api_error "$response"
+  arn=$(status_field "$response" taskArn)
+  if [[ -z "$arn" ]]; then
+    echo "Start response did not contain taskArn: $response" >&2
+    exit 1
+  fi
+  printf '%s\n' "$arn" > "$STATE_FILE"
+  echo "Launched task: $arn" >&2
+  wait_for_running "$arn"
+}
+
+stop_task() {
+  local arn response body status
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo "No saved task ARN. Start a task with: $0 start" >&2
+    exit 1
+  fi
+  arn=$(<"$STATE_FILE")
+  response=$("$CURL" "${CURL_ARGS[@]}" --request POST --get \
+    --data-urlencode "taskArn=$arn" "$API_BASE/stop")
+  assert_no_api_error "$response"
+  echo "Stop requested for: $arn" >&2
+
+  for ((attempt=1; attempt<=MAX_POLLS; attempt++)); do
+    body=$(request_status "$arn")
+    assert_no_api_error "$body"
+    status=$(status_field "$body" status)
+    if [[ "$status" == "STOPPED" ]]; then
+      rm -f "$STATE_FILE"
+      echo "Stopped ECS task: $arn"
+      return 0
+    fi
+    echo "[$attempt/$MAX_POLLS] Waiting for stop: ${status:-UNKNOWN}" >&2
+    sleep "$POLL_INTERVAL"
+  done
+  echo "Stop requested but not yet confirmed. ARN remains saved in $STATE_FILE" >&2
+  return 1
+}
+
+case "${1:-}" in
+  start) start_task ;;
+  stop) stop_task ;;
+  status)
+    if [[ ! -s "$STATE_FILE" ]]; then
+      echo "No saved task ARN. Start a task first." >&2
+      exit 1
+    fi
+    response=$(request_status "$(<"$STATE_FILE")")
+    assert_no_api_error "$response"
+    jq . <<< "$response"
+    ;;
+  *) echo "Usage: $0 {start|status|stop}" >&2; exit 2 ;;
+esac
