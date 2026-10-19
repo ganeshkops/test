@@ -1,0 +1,167 @@
+import json
+import logging
+import os
+
+import boto3
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+ecs = boto3.client("ecs")
+ec2 = boto3.client("ec2")
+
+CLUSTER = os.environ["ECS_CLUSTER"]
+TASK_DEFINITION = os.environ["TASK_DEFINITION"]
+SECURITY_GROUP_ID = os.environ["SECURITY_GROUP_ID"]
+SUBNETS = [
+    subnet.strip()
+    for subnet in os.environ.get("SUBNET_IDS", os.environ.get("SUBNET_ID", "")).split(",")
+    if subnet.strip()
+]
+CONTAINER_PORT = int(os.environ.get("CONTAINER_PORT", "80"))
+
+
+def reply(status_code, data):
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(data),
+    }
+
+
+def lambda_handler(event, context):
+    # API Gateway HTTP API (payload format 2.0)
+    http = (event.get("requestContext") or {}).get("http") or {}
+    method = http.get("method", "")
+    path = event.get("rawPath", "")
+    params = event.get("queryStringParameters") or {}
+
+    try:
+        if method == "POST" and path == "/start":
+            if not SUBNETS:
+                return reply(500, {"error": "Set SUBNET_IDS or SUBNET_ID"})
+
+            response = ecs.run_task(
+                cluster=CLUSTER,
+                taskDefinition=TASK_DEFINITION,
+                launchType="FARGATE",
+                count=1,
+                networkConfiguration={
+                    "awsvpcConfiguration": {
+                        "subnets": SUBNETS,
+                        "securityGroups": [SECURITY_GROUP_ID],
+                        "assignPublicIp": "ENABLED",
+                    }
+                },
+            )
+
+            if response.get("failures") or not response.get("tasks"):
+                return reply(500, {
+                    "error": "Could not launch ECS task",
+                    "failures": response.get("failures", []),
+                })
+
+            task_arn = response["tasks"][0]["taskArn"]
+            logger.info("Started ECS task: %s", task_arn)
+            return reply(200, {
+                "message": "ECS Fargate task launch requested",
+                "taskArn": task_arn,
+                "next": "GET /status?taskArn=<URL-ENCODED-TASK-ARN>",
+            })
+
+        if method in ("GET", "POST") and path == "/status":
+            task_arn = params.get("taskArn")
+            if not task_arn:
+                return reply(400, {"error": "Missing taskArn query parameter"})
+
+            response = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])
+            if not response.get("tasks"):
+                return reply(404, {
+                    "error": "Task not found",
+                    "failures": response.get("failures", []),
+                })
+
+            task = response["tasks"][0]
+            status = task["lastStatus"]
+            result = {
+                "taskArn": task_arn,
+                "status": status,
+                "desiredStatus": task.get("desiredStatus"),
+                "privateIp": None,
+                "publicIp": None,
+                "privateUrl": None,
+                "publicUrl": None,
+            }
+            if task.get("stoppedReason"):
+                result["stoppedReason"] = task["stoppedReason"]
+
+            if status == "RUNNING":
+                eni_id = next(
+                    (
+                        detail["value"]
+                        for attachment in task.get("attachments", [])
+                        for detail in attachment.get("details", [])
+                        if detail.get("name") == "networkInterfaceId"
+                    ),
+                    None,
+                )
+                if eni_id:
+                    interfaces = ec2.describe_network_interfaces(
+                        NetworkInterfaceIds=[eni_id]
+                    )["NetworkInterfaces"]
+                    if interfaces:
+                        eni = interfaces[0]
+                        private_ip = eni.get("PrivateIpAddress")
+                        public_ip = (eni.get("Association") or {}).get("PublicIp")
+                        result["privateIp"] = private_ip
+                        result["publicIp"] = public_ip
+                        if private_ip:
+                            result["privateUrl"] = f"http://{private_ip}:{CONTAINER_PORT}"
+                        if public_ip:
+                            result["publicUrl"] = f"http://{public_ip}:{CONTAINER_PORT}"
+
+            return reply(200, result)
+
+        if method == "POST" and path == "/stop":
+            task_arn = params.get("taskArn")
+            if not task_arn:
+                return reply(400, {"error": "Missing taskArn query parameter"})
+
+            # Verify task is part of the configured cluster before stopping it.
+            lookup = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])
+            if not lookup.get("tasks"):
+                return reply(404, {"error": "Task not found in configured cluster"})
+
+            task = lookup["tasks"][0]
+            if task.get("lastStatus") == "STOPPED":
+                return reply(200, {
+                    "message": "Task is already stopped",
+                    "taskArn": task_arn,
+                    "status": "STOPPED",
+                })
+
+            response = ecs.stop_task(
+                cluster=CLUSTER,
+                task=task_arn,
+                reason="Stopped via MCP POC API",
+            )
+            logger.info("Requested stop for task: %s", task_arn)
+            return reply(200, {
+                "message": "ECS task stop requested",
+                "taskArn": task_arn,
+                "status": response["task"]["lastStatus"],
+            })
+
+        return reply(404, {"error": "Unknown route", "method": method, "path": path})
+
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        logger.exception("AWS API error")
+        return reply(500, {
+            "error": error.get("Code", "AWSClientError"),
+            "message": error.get("Message", "AWS API call failed"),
+        })
+    except Exception:
+        logger.exception("Unexpected Lambda error")
+        return reply(500, {"error": "Internal server error; see CloudWatch logs"})
