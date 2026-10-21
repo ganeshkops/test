@@ -1,0 +1,1 @@
+CMD ["sh", "-c", "set -e; : \"${SSH_PUBLIC_KEY:?SSH_PUBLIC_KEY is required}\"; printf '%s\\n' \"$SSH_PUBLIC_KEY\" > /home/dev/.ssh/authorized_keys; chown dev:dev /home/dev/.ssh/authorized_keys; chmod 600 /home/dev/.ssh/authorized_keys; ssh-keygen -A; /usr/sbin/sshd -e; exec su -s /bin/sh dev -c 'cd /app && exec python -u mcp_server.py'"]
